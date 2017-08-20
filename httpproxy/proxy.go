@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -157,13 +158,13 @@ func (proxy *Proxy) onTheFlyGenerateCertificate(host string) *tls.Config {
 
 func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		bytes, err := httputil.DumpRequest(req, true)
+		originalReqBytes, err := httputil.DumpRequest(req, true)
 
 		if err != nil {
 			log.Fatalln(err)
 		}
 
-		log.Println(string(bytes))
+		log.Println(string(originalReqBytes))
 
 		if req.Method == http.MethodConnect {
 			hijacker, ok := rw.(http.Hijacker)
@@ -200,33 +201,92 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 
 			clientReader := bufio.NewReader(tlsClientConnection)
 
-			realReq, err := http.ReadRequest(clientReader)
-
-			if err != nil {
-				panic(err)
-			}
-
-			bytesReq, _ := httputil.DumpRequest(realReq, true)
-			if err != nil {
-				panic(err)
-			}
-			log.Printf("Printing request: %s\n", string(bytesReq))
-
 			targetConnection, err := trans.DialContext(req.Context(), "tcp", req.URL.Host)
 
-			if err != nil {
-				panic(err)
-			}
+			go func() {
+				log.Println("handling tls connection")
 
-			realReq.URL.Scheme = "http"
-			realReq.URL.Host = req.URL.Hostname()
+				defer func() {
+					log.Println("closing both connections")
+					clientConnection.Close()
+					targetConnection.Close()
+				}()
 
-			targetResponse, err := trans.RoundTrip(realReq)
+				for !isEof(clientReader) {
+					log.Println("trying to read the request from the client")
 
-			if err != nil {
-				panic(err)
-			}
+					realReq, err := http.ReadRequest(clientReader)
 
+					if err != nil {
+						if err != io.EOF {
+							log.Printf("error while reading response: %v", err)
+						}
+						break
+					}
+
+					bytesReq, _ := httputil.DumpRequest(realReq, true)
+					if err != nil {
+						panic(err)
+					}
+					log.Printf("Printing request: %s\n", string(bytesReq))
+
+					if err != nil {
+						panic(err)
+					}
+
+					realReq.URL.Scheme = "https"
+					realReq.URL.Host = req.URL.Hostname()
+
+					targetResponse, err := trans.RoundTrip(realReq)
+
+					if err != nil {
+						log.Fatalf("rountTrip: %v", err)
+					}
+
+					if _, err := fmt.Fprintf(tlsClientConnection, "HTTP/%d.%d %s\r\n", 1, 1, targetResponse.Status); err != nil {
+						log.Fatalf("writing http status line: %v", err)
+					}
+
+					targetResponse.Header.Set("Connection", "close")
+					targetResponse.Header.Set("Transfer-Encoding", "chunked")
+
+					if err = targetResponse.Header.Write(tlsClientConnection); err != nil {
+						log.Fatalf("writing headers: %v", err)
+					}
+
+					tlsClientConnection.Write([]byte("\r\n"))
+
+					chunkedWriter := newChunkedWriter(tlsClientConnection)
+
+					if _, err := io.Copy(chunkedWriter, targetResponse.Body); err != nil {
+						log.Fatalf("error while writing the body to the client: %v", err)
+					}
+
+					if err := chunkedWriter.Close(); err != nil {
+						log.Fatalf("error while closing chunked writer: %v", err)
+					}
+
+					if _, err = io.WriteString(tlsClientConnection, "\r\n"); err != nil {
+						log.Fatalf("Cannot write TLS response chunked trailer from mitm'd client: %v", err)
+					} else {
+						log.Println("wrote final trailers")
+					}
+
+					// respBytes, _ := httputil.DumpResponse(targetResponse, false)
+
+					// targetResponse.Header.Set("Connection", "close")
+
+					// log.Printf("\n\n\nPrinting target response: %s\n\n\n\n", string(respBytes))
+
+					// if err = targetResponse.Write(tlsClientConnection); err != nil {
+					// 	panic(err)
+					// }
+				}
+
+				log.Println("broke the loop")
+			}()
+
+			/// NOT NEEDED YET
 			// targetReader := bufio.NewReader(targetConnection)
 
 			// err = realReq.Write(targetConnection)
@@ -236,10 +296,7 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 			// if err != nil {
 			// 	panic(err)
 			// }
-
-			if err = targetResponse.Write(tlsClientConnection); err != nil {
-				panic(err)
-			}
+			/// NOT NEEDED YET
 
 			// works
 			// wg := &sync.WaitGroup{}
@@ -262,10 +319,10 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 			// wg.Wait()
 			// works
 
-			log.Println("closing both connections")
+			// log.Println("closing both connections")
 
-			clientConnection.Close()
-			targetConnection.Close()
+			// clientConnection.Close()
+			// targetConnection.Close()
 		} else {
 			reverseProxy.ServeHTTP(rw, req)
 		}
@@ -286,6 +343,18 @@ func newReverseProxy() *httputil.ReverseProxy {
 			// }
 		},
 	}
+}
+
+func isEof(r *bufio.Reader) bool {
+	log.Println("before peek(1)")
+	_, err := r.Peek(1)
+
+	log.Printf("after peek(1): %v", err)
+
+	if err == io.EOF {
+		return true
+	}
+	return false
 }
 
 func newHttpsReverseProxy() *httputil.ReverseProxy {
