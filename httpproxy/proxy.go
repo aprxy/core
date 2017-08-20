@@ -3,6 +3,8 @@ package httpproxy
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +12,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
+
+	"github.com/google/easypki/pkg/easypki"
+
+	"github.com/google/easypki/pkg/store"
 )
 
 type Protocol string
@@ -22,6 +29,7 @@ type Proxy struct {
 	listenParam      string
 	url              *url.URL
 	proxyHandlerFunc http.HandlerFunc
+	pki              *easypki.EasyPKI
 }
 
 func NewProxy(protocol Protocol, ip, port string, proxyFunc http.HandlerFunc) (*Proxy, error) {
@@ -38,9 +46,61 @@ func NewProxy(protocol Protocol, ip, port string, proxyFunc http.HandlerFunc) (*
 		proxyFunc = http.HandlerFunc(defaultProxyFunc(reverseProxy))
 	}
 
-	return &Proxy{
-		protocol, listenParam, url, proxyFunc,
-	}, nil
+	proxy := &Proxy{
+		protocol, listenParam, url, proxyFunc, &easypki.EasyPKI{Store: &store.Local{Root: "/home/renannp/development/go/src/github.com/vamproxy/cli/certs"}},
+	}
+
+	generateCertificate(proxy)
+
+	return proxy, nil
+}
+
+func generateCertificate(proxy *Proxy) {
+	// priv, err := rsa.GenerateKey(rand.Reader, 2048)
+
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	commonSubject := pkix.Name{
+		Organization:       []string{"Vamproxy Inc."},
+		OrganizationalUnit: []string{"IT"},
+		Locality:           []string{"Your Desk"},
+		Country:            []string{"ZU"},
+		Province:           []string{"Your Mom"},
+	}
+
+	caRequest := &easypki.Request{
+		Name: "Root_CA",
+		Template: &x509.Certificate{
+			Subject:    commonSubject,
+			NotAfter:   time.Now().AddDate(100, 0, 0),
+			MaxPathLen: 1,
+			IsCA:       true,
+		},
+	}
+	caRequest.Template.Subject.CommonName = "Root CA"
+	if err := proxy.pki.Sign(nil, caRequest); err != nil {
+		log.Fatalf("Sign(nil, %v): got error: %v != expected nil", caRequest, err)
+	}
+	_, err := proxy.pki.GetCA(caRequest.Name)
+	if err != nil {
+		log.Fatalf("GetCA(%v): got error %v != expect nil", caRequest.Name, err)
+	}
+
+	// cliRequest := &Request{
+	// 	Name: "seila@seila.org",
+	// 	Template: &x509.Certificate{
+	// 		Subject:        commonSubject,
+	// 		NotAfter:       time.Now().AddDate(0, 0, 30),
+	// 		EmailAddresses: []string{"bob@acme.org"},
+	// 	},
+	// 	IsClientCertificate: true,
+	// }
+	// cliRequest.Template.Subject.CommonName = "bob@acme.org"
+	// if err := pki.Sign(rootCA, cliRequest); err != nil {
+	// }
+
 }
 
 func (p *Proxy) Start() {
@@ -88,7 +148,7 @@ func defaultProxyFunc(reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
 
 			clientConnection.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
 
-			tls.Server(clientConnection)
+			// tls.Server(clientConnection)
 
 			trans, ok := http.DefaultTransport.(*http.Transport)
 			if !ok {
@@ -156,7 +216,7 @@ func defaultProxyFunc(reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
 
 		// if req.URL.Port() == "443" && req.Method == http.MethodConnect {
 		if false {
-			// goproxy.NewCounterEncryptorRandFromKey
+			// goproxy.NewProxyHttpServer().ServeHTTP
 		}
 		// }
 	})
