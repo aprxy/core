@@ -28,8 +28,8 @@ type Proxy struct {
 	protocol         Protocol
 	listenParam      string
 	url              *url.URL
-	proxyHandlerFunc http.HandlerFunc
 	pki              *easypki.EasyPKI
+	proxyHandlerFunc http.HandlerFunc
 }
 
 func NewProxy(protocol Protocol, ip, port string, proxyFunc http.HandlerFunc) (*Proxy, error) {
@@ -41,37 +41,38 @@ func NewProxy(protocol Protocol, ip, port string, proxyFunc http.HandlerFunc) (*
 
 	listenParam := strings.Join([]string{ip, port}, ":")
 
-	if proxyFunc == nil {
-		reverseProxy := newReverseProxy()
-		proxyFunc = http.HandlerFunc(defaultProxyFunc(reverseProxy))
+	proxy := &Proxy{
+		protocol:    protocol,
+		listenParam: listenParam,
+		url:         url,
+		pki:         &easypki.EasyPKI{Store: &store.Local{Root: "/home/renannp/development/go/src/github.com/vamproxy/cli/certs"}},
 	}
 
-	proxy := &Proxy{
-		protocol, listenParam, url, proxyFunc, &easypki.EasyPKI{Store: &store.Local{Root: "/home/renannp/development/go/src/github.com/vamproxy/cli/certs"}},
+	if proxyFunc == nil {
+		reverseProxy := newReverseProxy()
+		proxyFunc = http.HandlerFunc(defaultProxyFunc(proxy, reverseProxy))
 	}
+
+	proxy.proxyHandlerFunc = proxyFunc
 
 	generateCertificate(proxy)
 
 	return proxy, nil
 }
 
+var commonSubject = pkix.Name{
+	Organization:       []string{"Vamproxy Inc."},
+	OrganizationalUnit: []string{"IT"},
+	Locality:           []string{"Your Desk"},
+	Country:            []string{"ZU"},
+	Province:           []string{"Your Mom"},
+}
+
+const caName = "Root_CA"
+
 func generateCertificate(proxy *Proxy) {
-	// priv, err := rsa.GenerateKey(rand.Reader, 2048)
-
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	commonSubject := pkix.Name{
-		Organization:       []string{"Vamproxy Inc."},
-		OrganizationalUnit: []string{"IT"},
-		Locality:           []string{"Your Desk"},
-		Country:            []string{"ZU"},
-		Province:           []string{"Your Mom"},
-	}
-
 	caRequest := &easypki.Request{
-		Name: "Root_CA",
+		Name: caName,
 		Template: &x509.Certificate{
 			Subject:    commonSubject,
 			NotAfter:   time.Now().AddDate(100, 0, 0),
@@ -81,49 +82,74 @@ func generateCertificate(proxy *Proxy) {
 	}
 	caRequest.Template.Subject.CommonName = "Root CA"
 	if err := proxy.pki.Sign(nil, caRequest); err != nil {
-		log.Fatalf("Sign(nil, %v): got error: %v != expected nil", caRequest, err)
+		log.Printf("Sign(nil, %v): got error: %v != expected nil", caRequest, err)
 	}
-	_, err := proxy.pki.GetCA(caRequest.Name)
-	if err != nil {
-		log.Fatalf("GetCA(%v): got error %v != expect nil", caRequest.Name, err)
-	}
-
-	// cliRequest := &Request{
-	// 	Name: "seila@seila.org",
-	// 	Template: &x509.Certificate{
-	// 		Subject:        commonSubject,
-	// 		NotAfter:       time.Now().AddDate(0, 0, 30),
-	// 		EmailAddresses: []string{"bob@acme.org"},
-	// 	},
-	// 	IsClientCertificate: true,
-	// }
-	// cliRequest.Template.Subject.CommonName = "bob@acme.org"
-	// if err := pki.Sign(rootCA, cliRequest); err != nil {
-	// }
-
 }
 
-func (p *Proxy) Start() {
+func (proxy *Proxy) Start() {
 
-	log.Printf("proxy starting at %s using %s protocol\n", p.listenParam, p.protocol)
+	log.Printf("proxy starting at %s using %s protocol\n", proxy.listenParam, proxy.protocol)
 
-	switch p.protocol {
+	switch proxy.protocol {
 	case HTTP_PROTOCOL:
 		{
 			// go func() {
-			log.Fatalln(http.ListenAndServe(p.listenParam, p.proxyHandlerFunc))
+			log.Fatalln(http.ListenAndServe(proxy.listenParam, proxy.proxyHandlerFunc))
 			// }()
 		}
 	case HTTPS_PROTOCOL:
 		{
 			// go func() {
-			log.Fatalln(http.ListenAndServeTLS(p.listenParam, "cert.pem", "key.pem", p.proxyHandlerFunc))
+			log.Fatalln(http.ListenAndServeTLS(proxy.listenParam, "cert.pem", "key.pem", proxy.proxyHandlerFunc))
 			// }()
 		}
 	}
 }
 
-func defaultProxyFunc(reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
+func (proxy *Proxy) onTheFlyGenerateCertificate(host string) *tls.Config {
+	caBundle, err := proxy.pki.GetCA(caName)
+	if err != nil {
+		log.Fatalf("GetCA(%v): got error %v != expect nil", caName, err)
+	}
+
+	cliRequest := &easypki.Request{
+		Name: host,
+		Template: &x509.Certificate{
+			Subject:        commonSubject,
+			NotAfter:       time.Now().AddDate(40, 0, 0),
+			EmailAddresses: []string{"bob@acme.org"},
+		},
+		IsClientCertificate: false,
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		cliRequest.Template.IPAddresses = append(cliRequest.Template.IPAddresses, ip)
+	} else {
+		cliRequest.Template.DNSNames = append(cliRequest.Template.DNSNames, host)
+	}
+
+	if err := proxy.pki.Sign(caBundle, cliRequest); err != nil {
+		panic(err)
+	}
+
+	// get the new generated certificate
+	hostBundle, err := proxy.pki.GetBundle(caName, host)
+	if err != nil {
+		panic(err)
+	}
+
+	cert := tls.Certificate{
+		Certificate: [][]byte{hostBundle.Cert.Raw},
+		PrivateKey:  caBundle.Key,
+	}
+
+	return &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: true,
+	}
+}
+
+func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		bytes, err := httputil.DumpRequest(req, true)
 
@@ -148,7 +174,11 @@ func defaultProxyFunc(reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
 
 			clientConnection.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
 
-			// tls.Server(clientConnection)
+			tlsClientConnection := tls.Server(clientConnection, proxy.onTheFlyGenerateCertificate(req.Host))
+
+			if err := tlsClientConnection.Handshake(); err != nil {
+				panic(err)
+			}
 
 			trans, ok := http.DefaultTransport.(*http.Transport)
 			if !ok {
@@ -161,7 +191,7 @@ func defaultProxyFunc(reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
 				panic(err)
 			}
 
-			clientReader, targetReader := bufio.NewReader(clientConnection), bufio.NewReader(targetConnection)
+			clientReader, targetReader := bufio.NewReader(tlsClientConnection), bufio.NewReader(targetConnection)
 
 			req, err := http.ReadRequest(clientReader)
 
