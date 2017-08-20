@@ -115,9 +115,14 @@ func (proxy *Proxy) onTheFlyGenerateCertificate(host string) *tls.Config {
 	cliRequest := &easypki.Request{
 		Name: host,
 		Template: &x509.Certificate{
-			Subject:        commonSubject,
-			NotAfter:       time.Now().AddDate(40, 0, 0),
-			EmailAddresses: []string{"bob@acme.org"},
+			Subject:               commonSubject,
+			NotBefore:             time.Unix(0, 0),
+			NotAfter:              time.Now().AddDate(40, 0, 0),
+			EmailAddresses:        []string{"bob@acme.org"},
+			Issuer:                caBundle.Cert.Subject,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		},
 		IsClientCertificate: false,
 	}
@@ -128,19 +133,20 @@ func (proxy *Proxy) onTheFlyGenerateCertificate(host string) *tls.Config {
 		cliRequest.Template.DNSNames = append(cliRequest.Template.DNSNames, host)
 	}
 
-	if err := proxy.pki.Sign(caBundle, cliRequest); err != nil {
-		panic(err)
-	}
-
 	// get the new generated certificate
 	hostBundle, err := proxy.pki.GetBundle(caName, host)
 	if err != nil {
-		panic(err)
+		if err := proxy.pki.Sign(caBundle, cliRequest); err != nil {
+			log.Println(err)
+			return nil
+		}
+
+		hostBundle, _ = proxy.pki.GetBundle(caName, host)
 	}
 
 	cert := tls.Certificate{
 		Certificate: [][]byte{hostBundle.Cert.Raw},
-		PrivateKey:  caBundle.Key,
+		PrivateKey:  hostBundle.Key,
 	}
 
 	return &tls.Config{
@@ -174,7 +180,14 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 
 			clientConnection.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
 
-			tlsClientConnection := tls.Server(clientConnection, proxy.onTheFlyGenerateCertificate(req.Host))
+			cfg := proxy.onTheFlyGenerateCertificate(req.Host)
+			if cfg == nil {
+				clientConnection.Write([]byte("HTTP/1.0 500 OK\r\n\r\n"))
+				clientConnection.Close()
+				return
+			}
+
+			tlsClientConnection := tls.Server(clientConnection, cfg)
 
 			if err := tlsClientConnection.Handshake(); err != nil {
 				panic(err)
@@ -185,33 +198,46 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 				panic("not ok")
 			}
 
+			clientReader := bufio.NewReader(tlsClientConnection)
+
+			realReq, err := http.ReadRequest(clientReader)
+
+			if err != nil {
+				panic(err)
+			}
+
+			bytesReq, _ := httputil.DumpRequest(realReq, true)
+			if err != nil {
+				panic(err)
+			}
+			log.Printf("Printing request: %s\n", string(bytesReq))
+
 			targetConnection, err := trans.DialContext(req.Context(), "tcp", req.URL.Host)
 
 			if err != nil {
 				panic(err)
 			}
 
-			clientReader, targetReader := bufio.NewReader(tlsClientConnection), bufio.NewReader(targetConnection)
+			realReq.URL.Scheme = "http"
+			realReq.URL.Host = req.URL.Hostname()
 
-			req, err := http.ReadRequest(clientReader)
-
-			if err != nil {
-				panic(err)
-			}
-
-			err = req.Write(targetConnection)
+			targetResponse, err := trans.RoundTrip(realReq)
 
 			if err != nil {
 				panic(err)
 			}
 
-			resp, err := http.ReadResponse(targetReader, req)
+			// targetReader := bufio.NewReader(targetConnection)
 
-			if err != nil {
-				panic(err)
-			}
+			// err = realReq.Write(targetConnection)
 
-			if err = resp.Write(clientConnection); err != nil {
+			// resp, err := http.ReadResponse(targetReader, req)
+
+			// if err != nil {
+			// 	panic(err)
+			// }
+
+			if err = targetResponse.Write(tlsClientConnection); err != nil {
 				panic(err)
 			}
 
