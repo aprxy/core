@@ -199,9 +199,18 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 				panic("not ok")
 			}
 
+			trans.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
 			clientReader := bufio.NewReader(tlsClientConnection)
 
+			// targetConnection, err := trans.DialTLS(req.Context(), "tcp", req.URL.Host)
+			log.Printf("connecting to %s\n", req.URL.Host)
 			targetConnection, err := trans.DialContext(req.Context(), "tcp", req.URL.Host)
+
+			if err != nil {
+				log.Printf("error while connecting to the target host %s: %v", req.URL.Host, err)
+				return
+			}
 
 			go func() {
 				log.Println("handling tls connection")
@@ -224,6 +233,9 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 						break
 					}
 
+					realReq.URL.Scheme = "https"
+					realReq.URL.Host = req.URL.Hostname()
+
 					bytesReq, _ := httputil.DumpRequest(realReq, true)
 					if err != nil {
 						panic(err)
@@ -234,8 +246,9 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 						panic(err)
 					}
 
-					realReq.URL.Scheme = "https"
-					realReq.URL.Host = req.URL.Hostname()
+					realReq.RemoteAddr = req.RemoteAddr
+
+					removeProxyHeaders(realReq)
 
 					targetResponse, err := trans.RoundTrip(realReq)
 
@@ -256,7 +269,7 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 
 					tlsClientConnection.Write([]byte("\r\n"))
 
-					chunkedWriter := newChunkedWriter(tlsClientConnection)
+					chunkedWriter := NewChunkedWriter(tlsClientConnection)
 
 					if _, err := io.Copy(chunkedWriter, targetResponse.Body); err != nil {
 						log.Fatalf("error while writing the body to the client: %v", err)
@@ -333,6 +346,27 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 		}
 		// }
 	})
+}
+
+// from goproxy
+func removeProxyHeaders(r *http.Request) {
+	r.RequestURI = "" // this must be reset when serving a request with the client
+	log.Printf("Sending request %v %v\n", r.Method, r.URL.String())
+	// If no Accept-Encoding header exists, Transport will add the headers it can accept
+	// and would wrap the response body with the relevant reader.
+	r.Header.Del("Accept-Encoding")
+	// curl can add that, see
+	// https://jdebp.eu./FGA/web-proxy-connection-header.html
+	r.Header.Del("Proxy-Connection")
+	r.Header.Del("Proxy-Authenticate")
+	r.Header.Del("Proxy-Authorization")
+	// Connection, Authenticate and Authorization are single hop Header:
+	// http://www.w3.org/Protocols/rfc2616/rfc2616.txt
+	// 14.10 Connection
+	//   The Connection general-header field allows the sender to specify
+	//   options that are desired for that particular connection and MUST NOT
+	//   be communicated by proxies over further connections.
+	r.Header.Del("Connection")
 }
 
 func newReverseProxy() *httputil.ReverseProxy {
