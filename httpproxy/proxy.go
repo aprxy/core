@@ -100,10 +100,10 @@ func (proxy *Proxy) Start() {
 	log.Fatalln(http.ListenAndServe(proxy.listenParam, proxy.proxyHandlerFunc))
 }
 
-func (proxy *Proxy) onTheFlyGenerateCertificate(host string) *tls.Config {
+func (proxy *Proxy) onTheFlyGenerateCertificate(host string) (*tls.Config, error) {
 	caBundle, err := proxy.pki.GetCA(caName)
 	if err != nil {
-		log.Fatalf("GetCA(%v): got error %v != expect nil", caName, err)
+		return nil, errors.Wrapf(err, "could not get the CA %s", caName)
 	}
 
 	cliRequest := &easypki.Request{
@@ -131,8 +131,7 @@ func (proxy *Proxy) onTheFlyGenerateCertificate(host string) *tls.Config {
 	hostBundle, err := proxy.pki.GetBundle(caName, host)
 	if err != nil {
 		if err := proxy.pki.Sign(caBundle, cliRequest); err != nil {
-			log.Println(err)
-			return nil
+			return nil, errors.Wrapf(err, "could not sign the certificate for %s", cliRequest.Name)
 		}
 
 		hostBundle, _ = proxy.pki.GetBundle(caName, host)
@@ -146,7 +145,7 @@ func (proxy *Proxy) onTheFlyGenerateCertificate(host string) *tls.Config {
 	return &tls.Config{
 		Certificates:       []tls.Certificate{cert},
 		InsecureSkipVerify: true,
-	}
+	}, nil
 }
 
 func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
@@ -231,10 +230,9 @@ func (proxy *Proxy) handleHttpsProxy(req *http.Request, rw http.ResponseWriter) 
 		return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "error while writing the http header"))
 	}
 
-	// TODO: make the below method return errors
-	cfg := proxy.onTheFlyGenerateCertificate(req.Host)
-	if cfg == nil {
-		return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.New("error while getting the certificate"))
+	cfg, err := proxy.onTheFlyGenerateCertificate(req.Host)
+	if err != nil {
+		return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrapf(err, "error while getting the certificate for %s", req.Host))
 	}
 
 	tlsClientConnection := tls.Server(clientConnection, cfg)
