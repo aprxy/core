@@ -6,47 +6,53 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"os/user"
 	"strings"
 	"time"
 
 	"github.com/google/easypki/pkg/easypki"
 
 	"github.com/google/easypki/pkg/store"
+	"github.com/pkg/errors"
 )
 
-type Protocol string
-
-const HTTP_PROTOCOL Protocol = "http://"
-const HTTPS_PROTOCOL Protocol = "https://"
-
 type Proxy struct {
-	protocol         Protocol
 	listenParam      string
-	url              *url.URL
 	pki              *easypki.EasyPKI
 	proxyHandlerFunc http.HandlerFunc
 }
 
-func NewProxy(protocol Protocol, ip, port string, proxyFunc http.HandlerFunc) (*Proxy, error) {
-	url, err := url.Parse(fmt.Sprintf("%s%s:%s", protocol, ip, port))
-
+func NewProxy(ip, port string, proxyFunc http.HandlerFunc) (*Proxy, error) {
+	u, err := user.Current()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "could not get the current user")
+	}
+
+	return NewProxyWithCustomCertStorePath(ip, port, fmt.Sprintf("%s/.vamproxy", u.HomeDir), nil)
+}
+
+func NewProxyWithCustomCertStorePath(ip, port, certStorePath string, proxyFunc http.HandlerFunc) (*Proxy, error) {
+	if err := os.Mkdir(certStorePath, os.ModePerm); err != nil {
+		if os.IsExist(err) {
+			log.Printf("%s already exists\n", certStorePath)
+		} else {
+			return nil, err
+		}
 	}
 
 	listenParam := strings.Join([]string{ip, port}, ":")
 
 	proxy := &Proxy{
-		protocol:    protocol,
 		listenParam: listenParam,
-		url:         url,
-		pki:         &easypki.EasyPKI{Store: &store.Local{Root: "/home/renannp/development/go/src/github.com/vamproxy/cli/certs"}},
+		pki:         &easypki.EasyPKI{Store: &store.Local{Root: certStorePath}},
 	}
 
 	if proxyFunc == nil {
@@ -87,24 +93,11 @@ func generateCertificate(proxy *Proxy) {
 	}
 }
 
+// Start starts the proxy using the given configuration in the NewProxy method
 func (proxy *Proxy) Start() {
+	log.Printf("proxy starting at %s using\n", proxy.listenParam)
 
-	log.Printf("proxy starting at %s using %s protocol\n", proxy.listenParam, proxy.protocol)
-
-	switch proxy.protocol {
-	case HTTP_PROTOCOL:
-		{
-			// go func() {
-			log.Fatalln(http.ListenAndServe(proxy.listenParam, proxy.proxyHandlerFunc))
-			// }()
-		}
-	case HTTPS_PROTOCOL:
-		{
-			// go func() {
-			log.Fatalln(http.ListenAndServeTLS(proxy.listenParam, "cert.pem", "key.pem", proxy.proxyHandlerFunc))
-			// }()
-		}
-	}
+	log.Fatalln(http.ListenAndServe(proxy.listenParam, proxy.proxyHandlerFunc))
 }
 
 func (proxy *Proxy) onTheFlyGenerateCertificate(host string) *tls.Config {
@@ -167,185 +160,183 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 		log.Println(string(originalReqBytes))
 
 		if req.Method == http.MethodConnect {
-			hijacker, ok := rw.(http.Hijacker)
-			if !ok {
-				rw.Write([]byte("error"))
-				rw.WriteHeader(http.StatusInternalServerError)
-			}
-
-			clientConnection, _, err := hijacker.Hijack()
-			if err != nil {
-				rw.Write([]byte("error"))
-				rw.WriteHeader(http.StatusInternalServerError)
-			}
-
-			clientConnection.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
-
-			cfg := proxy.onTheFlyGenerateCertificate(req.Host)
-			if cfg == nil {
-				clientConnection.Write([]byte("HTTP/1.0 500 OK\r\n\r\n"))
-				clientConnection.Close()
-				return
-			}
-
-			tlsClientConnection := tls.Server(clientConnection, cfg)
-
-			if err := tlsClientConnection.Handshake(); err != nil {
-				panic(err)
-			}
-
-			trans, ok := http.DefaultTransport.(*http.Transport)
-			if !ok {
-				panic("not ok")
-			}
-
-			trans.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-
-			clientReader := bufio.NewReader(tlsClientConnection)
-
-			// targetConnection, err := trans.DialTLS(req.Context(), "tcp", req.URL.Host)
-			log.Printf("connecting to %s\n", req.URL.Host)
-			targetConnection, err := trans.DialContext(req.Context(), "tcp", req.URL.Host)
-
-			if err != nil {
-				log.Printf("error while connecting to the target host %s: %v", req.URL.Host, err)
-				return
-			}
-
-			go func() {
-				log.Println("handling tls connection")
-
-				defer func() {
-					log.Println("closing both connections")
-					clientConnection.Close()
-					targetConnection.Close()
-				}()
-
-				for !isEof(clientReader) {
-					log.Println("trying to read the request from the client")
-
-					realReq, err := http.ReadRequest(clientReader)
-
-					if err != nil {
-						if err != io.EOF {
-							log.Printf("error while reading response: %v", err)
-						}
-						break
-					}
-
-					realReq.URL.Scheme = "https"
-					realReq.URL.Host = req.URL.Hostname()
-
-					bytesReq, _ := httputil.DumpRequest(realReq, true)
-					if err != nil {
-						panic(err)
-					}
-					log.Printf("Printing request: %s\n", string(bytesReq))
-
-					if err != nil {
-						panic(err)
-					}
-
-					realReq.RemoteAddr = req.RemoteAddr
-
-					removeProxyHeaders(realReq)
-
-					targetResponse, err := trans.RoundTrip(realReq)
-
-					if err != nil {
-						log.Fatalf("rountTrip: %v", err)
-					}
-
-					if _, err := fmt.Fprintf(tlsClientConnection, "HTTP/%d.%d %s\r\n", 1, 1, targetResponse.Status); err != nil {
-						log.Fatalf("writing http status line: %v", err)
-					}
-
-					targetResponse.Header.Set("Connection", "close")
-					targetResponse.Header.Set("Transfer-Encoding", "chunked")
-
-					if err = targetResponse.Header.Write(tlsClientConnection); err != nil {
-						log.Fatalf("writing headers: %v", err)
-					}
-
-					tlsClientConnection.Write([]byte("\r\n"))
-
-					chunkedWriter := NewChunkedWriter(tlsClientConnection)
-
-					if _, err := io.Copy(chunkedWriter, targetResponse.Body); err != nil {
-						log.Fatalf("error while writing the body to the client: %v", err)
-					}
-
-					if err := chunkedWriter.Close(); err != nil {
-						log.Fatalf("error while closing chunked writer: %v", err)
-					}
-
-					if _, err = io.WriteString(tlsClientConnection, "\r\n"); err != nil {
-						log.Fatalf("Cannot write TLS response chunked trailer from mitm'd client: %v", err)
-					} else {
-						log.Println("wrote final trailers")
-					}
-
-					// respBytes, _ := httputil.DumpResponse(targetResponse, false)
-
-					// targetResponse.Header.Set("Connection", "close")
-
-					// log.Printf("\n\n\nPrinting target response: %s\n\n\n\n", string(respBytes))
-
-					// if err = targetResponse.Write(tlsClientConnection); err != nil {
-					// 	panic(err)
-					// }
-				}
-
-				log.Println("broke the loop")
-			}()
-
-			/// NOT NEEDED YET
-			// targetReader := bufio.NewReader(targetConnection)
-
-			// err = realReq.Write(targetConnection)
-
-			// resp, err := http.ReadResponse(targetReader, req)
-
-			// if err != nil {
-			// 	panic(err)
-			// }
-			/// NOT NEEDED YET
-
-			// works
-			// wg := &sync.WaitGroup{}
-			// wg.Add(2)
-			// go func() {
-			// 	if _, err := io.Copy(proxyConn, clientConn); err != nil {
-			// 		log.Printf("%+v\n", err)
-			// 	}
-			// 	wg.Done()
-			// }()
-
-			// go func() {
-			// 	if _, err := io.Copy(clientConn, proxyConn); err != nil {
-			// 		log.Printf("%+v\n", err)
-			// 	}
-
-			// 	wg.Done()
-			// }()
-
-			// wg.Wait()
-			// works
-
-			// log.Println("closing both connections")
-
-			// clientConnection.Close()
-			// targetConnection.Close()
+			proxy.handleHttpsProxy(req, rw)
 		} else {
 			reverseProxy.ServeHTTP(rw, req)
 		}
-
-		// if req.URL.Port() == "443" && req.Method == http.MethodConnect {
-		if false {
-			// goproxy.NewProxyHttpServer().ServeHTTP
-		}
-		// }
 	})
+}
+
+const RAW_HTTP_1_0_200 string = "HTTP/1.0 200 OK\r\n\r\n"
+const RAW_HTTP_1_0_502 string = "HTTP/1.0 502 Bad Gateway\r\n\r\n"
+const RAW_HTTP_1_0_500 string = "HTTP/1.0 500 Internal Proxy Error\r\n\r\n"
+const VAMPROXY_ERROR string = `
+<html>
+<title>Vamproxy error</title>
+<body>
+	<h2>Error {{.StatusCode}} while executing the below request:</h2><br><br>
+	{{if .ReadReqError}}
+	{{.ReadReqError}}
+	{{else}}
+	{{.ReqBody}}
+	{{end}}
+	<br><br>
+</body>
+</html>
+`
+
+func handleProxyError(req *http.Request, writer io.Writer, httpStatus uint, httpHead string, givenError error) error {
+	tpl, err := template.New("errorTemplate").Parse(VAMPROXY_ERROR)
+
+	// if an error happens here, then it means that the template is broken (which should never happen)
+	if err != nil {
+		panic(err)
+	}
+
+	reqBytes, err := httputil.DumpRequest(req, true)
+	data := make(map[string]interface{})
+	data["StatusCode"] = httpStatus
+	if err != nil {
+		data["ReadReqError"] = err.Error()
+	} else {
+		data["ReqDump"] = string(reqBytes)
+	}
+
+	_, err = fmt.Fprint(writer, httpHead)
+	if err != nil {
+		return errors.Wrap(err, "error while writing http head")
+	}
+
+	err = tpl.Execute(writer, data)
+	if err != nil {
+		return errors.Wrap(err, "error while executing the error template")
+	}
+
+	return givenError
+}
+
+func (proxy *Proxy) handleHttpsProxy(req *http.Request, rw http.ResponseWriter) error {
+	hijacker, ok := rw.(http.Hijacker)
+	if !ok {
+		return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.New("response writer doesn't implement http.Hijacker"))
+	}
+
+	clientConnection, _, err := hijacker.Hijack()
+	if err != nil {
+		return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "could not hijack the client connection"))
+	}
+
+	_, err = fmt.Fprint(clientConnection, RAW_HTTP_1_0_200)
+	if err != nil {
+		return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "error while writing the http header"))
+	}
+
+	// TODO: make the below method return errors
+	cfg := proxy.onTheFlyGenerateCertificate(req.Host)
+	if cfg == nil {
+		return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.New("error while getting the certificate"))
+	}
+
+	tlsClientConnection := tls.Server(clientConnection, cfg)
+
+	if err := tlsClientConnection.Handshake(); err != nil {
+		return handleProxyError(req, rw, http.StatusInsufficientStorage, RAW_HTTP_1_0_500, errors.Wrap(err, "error while doing TLS handshake"))
+	}
+
+	trans, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		panic("cannot type assert http.DefaultTransport to http.Transport")
+	}
+
+	trans.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
+	clientReader := bufio.NewReader(tlsClientConnection)
+
+	log.Printf("connecting to %s\n", req.URL.Host)
+	targetConnection, err := trans.DialContext(req.Context(), "tcp", req.URL.Host)
+
+	if err != nil {
+		return handleProxyError(req, rw, http.StatusBadGateway, RAW_HTTP_1_0_502, errors.Wrapf(err, "error while connecting to the target host %s: %v", req.URL.Host, err))
+	}
+
+	func() {
+		log.Println("handling tls connection")
+
+		defer func() {
+			log.Println("closing both connections")
+			clientConnection.Close()
+			targetConnection.Close()
+		}()
+
+		for !isEof(clientReader) {
+			log.Println("trying to read the request from the client")
+
+			realReq, err := http.ReadRequest(clientReader)
+
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("error while reading response: %v", err)
+				}
+				break
+			}
+
+			realReq.URL.Scheme = "https"
+			realReq.URL.Host = req.URL.Hostname()
+
+			bytesReq, _ := httputil.DumpRequest(realReq, true)
+			if err != nil {
+				panic(err)
+			}
+			log.Printf("Printing request: %s\n", string(bytesReq))
+
+			if err != nil {
+				panic(err)
+			}
+
+			realReq.RemoteAddr = req.RemoteAddr
+
+			removeProxyHeaders(realReq)
+
+			targetResponse, err := trans.RoundTrip(realReq)
+
+			if err != nil {
+				log.Fatalf("rountTrip: %v", err)
+			}
+
+			if _, err := fmt.Fprintf(tlsClientConnection, "HTTP/%d.%d %s\r\n", 1, 1, targetResponse.Status); err != nil {
+				log.Fatalf("writing http status line: %v", err)
+			}
+
+			targetResponse.Header.Set("Connection", "close")
+			targetResponse.Header.Set("Transfer-Encoding", "chunked")
+
+			if err = targetResponse.Header.Write(tlsClientConnection); err != nil {
+				log.Fatalf("writing headers: %v", err)
+			}
+
+			tlsClientConnection.Write([]byte("\r\n"))
+
+			chunkedWriter := NewChunkedWriter(tlsClientConnection)
+
+			if _, err := io.Copy(chunkedWriter, targetResponse.Body); err != nil {
+				log.Fatalf("error while writing the body to the client: %v", err)
+			}
+
+			if err := chunkedWriter.Close(); err != nil {
+				log.Fatalf("error while closing chunked writer: %v", err)
+			}
+
+			if _, err = io.WriteString(tlsClientConnection, "\r\n"); err != nil {
+				log.Fatalf("Cannot write TLS response chunked trailer from mitm'd client: %v", err)
+			} else {
+				log.Println("wrote final trailers")
+			}
+		}
+
+		log.Println("broke the loop")
+	}()
+
+	return nil
 }
 
 // from goproxy
