@@ -158,6 +158,7 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.Ha
 
 		log.Println(string(originalReqBytes))
 
+		// it means we're receiving a HTTPS request
 		if req.Method == http.MethodConnect {
 			proxy.handleHttpsProxy(req, rw)
 		} else {
