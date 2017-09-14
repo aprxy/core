@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/user"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -57,12 +58,14 @@ func NewProxyWithCustomCertStorePath(ip, port, certStorePath string, proxyFunc h
 
 	if proxyFunc == nil {
 		reverseProxy := newReverseProxy()
-		proxyFunc = http.HandlerFunc(defaultProxyFunc(proxy, reverseProxy))
+		proxyFunc = http.HandlerFunc(sentryFunc(defaultProxyFunc(proxy, reverseProxy)))
 	}
 
 	proxy.proxyHandlerFunc = proxyFunc
 
-	generateCertificate(proxy)
+	if err := generateRooCA(proxy); err != nil {
+		return nil, errors.Wrap(err, "error while generating root CA")
+	}
 
 	return proxy, nil
 }
@@ -75,9 +78,16 @@ var commonSubject = pkix.Name{
 	Province:           []string{"Your Mom"},
 }
 
-const caName = "Root_CA"
+const caName = "VamproxyRootCA"
 
-func generateCertificate(proxy *Proxy) {
+func generateRooCA(proxy *Proxy) error {
+	if _, err := proxy.pki.GetCA(caName); err == nil {
+		return nil
+	} else {
+		// this warn ir ok during the first run
+		log.Printf("WARN: %+v\n", err)
+	}
+
 	caRequest := &easypki.Request{
 		Name: caName,
 		Template: &x509.Certificate{
@@ -87,15 +97,18 @@ func generateCertificate(proxy *Proxy) {
 			IsCA:       true,
 		},
 	}
-	caRequest.Template.Subject.CommonName = "Root CA"
+	caRequest.Template.Subject.CommonName = caName
+
 	if err := proxy.pki.Sign(nil, caRequest); err != nil {
-		log.Printf("Sign(nil, %v): got error: %v != expected nil", caRequest, err)
+		return errors.Wrapf(err, "Sign(nil, %v)", caRequest)
 	}
+
+	return nil
 }
 
 // Start starts the proxy using the given configuration in the NewProxy method
 func (proxy *Proxy) Start() {
-	log.Printf("proxy starting at %s using\n", proxy.listenParam)
+	log.Printf("proxy starting at %s\n", proxy.listenParam)
 
 	log.Fatalln(http.ListenAndServe(proxy.listenParam, proxy.proxyHandlerFunc))
 }
@@ -148,22 +161,39 @@ func (proxy *Proxy) onTheFlyGenerateCertificate(host string) (*tls.Config, error
 	}, nil
 }
 
-func defaultProxyFunc(proxy *Proxy, reverseProxy *ReverseProxy) http.HandlerFunc {
+type handlerFuncExt func(rw http.ResponseWriter, req *http.Request) error
+
+func sentryFunc(handler handlerFuncExt) http.HandlerFunc {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("panic: %+v\n\nstack trace: %s\n\n", err, string(debug.Stack()))
+			}
+		}()
+
+		if err := handler(rw, req); err != nil {
+			log.Printf("%+v\n", err)
+		}
+	})
+}
+
+func defaultProxyFunc(proxy *Proxy, reverseProxy *ReverseProxy) handlerFuncExt {
+	return handlerFuncExt(func(rw http.ResponseWriter, req *http.Request) error {
 		originalReqBytes, err := httputil.DumpRequest(req, true)
 
 		if err != nil {
-			log.Fatalln(err)
+			return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "error while dumping incoming request"))
 		}
 
-		log.Println(string(originalReqBytes))
+		log.Printf("incoming request: \n%s\n", string(originalReqBytes))
 
 		// it means we're receiving a HTTPS request
 		if req.Method == http.MethodConnect {
-			proxy.handleHttpsProxy(req, rw)
-		} else {
-			reverseProxy.ServeHTTP(rw, req)
+			return proxy.handleHttpsProxy(req, rw)
 		}
+
+		reverseProxy.ServeHTTP(rw, req)
+		return nil
 	})
 }
 
@@ -188,6 +218,14 @@ const VAMPROXY_ERROR string = `
 `
 
 func handleProxyError(req *http.Request, writer io.Writer, httpStatus uint, httpHead string, givenError error) error {
+	if givenError == nil {
+		return nil
+	}
+
+	// if msg, isFixable := isFixableError(errors.Cause(givenError)); isFixable {
+	// 	return nil
+	// }
+
 	tpl, err := template.New("errorTemplate").Parse(VAMPROXY_ERROR)
 
 	// if an error happens here, then it means that the template is broken (which should never happen)
@@ -208,7 +246,7 @@ func handleProxyError(req *http.Request, writer io.Writer, httpStatus uint, http
 
 	_, err = fmt.Fprint(writer, httpHead)
 	if err != nil {
-		return errors.Wrap(err, "error while writing http head")
+		return errors.Wrapf(err, "error while writing http head\npossible cause: %+v", givenError.Error())
 	}
 
 	err = tpl.Execute(writer, data)
@@ -218,6 +256,19 @@ func handleProxyError(req *http.Request, writer io.Writer, httpStatus uint, http
 
 	return givenError
 }
+
+// func isFixableError(err error) (string, error) {
+// 	switch e := err.(type) {
+// 	case *net.OpError:
+// 		{
+// 			if e.Err == error(48) {
+// 				return "you need to import the Root_CA to fix this error", true
+// 			}
+// 		}
+// 	}
+
+// 	return "", false
+// }
 
 func (proxy *Proxy) handleHttpsProxy(req *http.Request, rw http.ResponseWriter) error {
 	hijacker, ok := rw.(http.Hijacker)
@@ -289,9 +340,9 @@ func (proxy *Proxy) handleHttpsProxy(req *http.Request, rw http.ResponseWriter) 
 		bytesReq, err := httputil.DumpRequest(realReq, true)
 		if err != nil {
 			log.Printf("could not dump the request: %+v", err)
+		} else {
+			log.Printf("outcoming request:\n%s\n", string(bytesReq))
 		}
-
-		log.Printf("Printing request:\n%s\n", string(bytesReq))
 
 		removeProxyHeaders(realReq)
 
@@ -326,9 +377,9 @@ func (proxy *Proxy) handleHttpsProxy(req *http.Request, rw http.ResponseWriter) 
 
 		if _, err = io.WriteString(tlsClientConnection, "\r\n"); err != nil {
 			return handleProxyError(realReq, tlsClientConnection, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "Cannot write TLS response chunked trailer from mitm'd client"))
-		} else {
-			log.Println("wrote final trailers")
 		}
+
+		log.Println("wrote final trailers")
 	}
 
 	log.Println("broke the loop")
