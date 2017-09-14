@@ -148,7 +148,7 @@ func (proxy *Proxy) onTheFlyGenerateCertificate(host string) (*tls.Config, error
 	}, nil
 }
 
-func defaultProxyFunc(proxy *Proxy, reverseProxy *httputil.ReverseProxy) http.HandlerFunc {
+func defaultProxyFunc(proxy *Proxy, reverseProxy *ReverseProxy) http.HandlerFunc {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		originalReqBytes, err := httputil.DumpRequest(req, true)
 
@@ -357,12 +357,9 @@ func removeProxyHeaders(r *http.Request) {
 	r.Header.Del("Connection")
 }
 
-func newReverseProxy() *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{
+func newReverseProxy() *ReverseProxy {
+	return &ReverseProxy{
 		Director: func(req *http.Request) {
-			// if req.URL.Port() == "443" && req.Method == http.MethodConnect {
-			// req.URL.Scheme = "http"
-			// }
 		},
 	}
 }
