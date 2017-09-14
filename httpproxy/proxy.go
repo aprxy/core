@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/user"
 	"runtime/debug"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/easypki/pkg/easypki"
+	"github.com/vamproxy/core/ui"
 
 	"github.com/google/easypki/pkg/store"
 	"github.com/pkg/errors"
@@ -29,18 +29,23 @@ type Proxy struct {
 	listenParam      string
 	pki              *easypki.EasyPKI
 	proxyHandlerFunc http.HandlerFunc
+	vampire          ui.Vampire
 }
 
-func NewProxy(ip, port string, proxyFunc http.HandlerFunc) (*Proxy, error) {
+func DefaultProxy(ip, port string, vampire ui.Vampire) (*Proxy, error) {
 	u, err := user.Current()
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get the current user")
 	}
 
-	return NewProxyWithCustomCertStorePath(ip, port, fmt.Sprintf("%s/.vamproxy", u.HomeDir), nil)
+	if vampire == nil {
+		vampire = &ui.NoOpVampire{}
+	}
+
+	return newProxyCustom(ip, port, fmt.Sprintf("%s/.vamproxy", u.HomeDir), vampire)
 }
 
-func NewProxyWithCustomCertStorePath(ip, port, certStorePath string, proxyFunc http.HandlerFunc) (*Proxy, error) {
+func newProxyCustom(ip, port, certStorePath string, vampire ui.Vampire) (*Proxy, error) {
 	if err := os.Mkdir(certStorePath, os.ModePerm); err != nil {
 		if os.IsExist(err) {
 			log.Printf("%s already exists\n", certStorePath)
@@ -56,14 +61,13 @@ func NewProxyWithCustomCertStorePath(ip, port, certStorePath string, proxyFunc h
 		pki:         &easypki.EasyPKI{Store: &store.Local{Root: certStorePath}},
 	}
 
-	if proxyFunc == nil {
-		reverseProxy := newReverseProxy()
-		proxyFunc = http.HandlerFunc(sentryFunc(defaultProxyFunc(proxy, reverseProxy)))
-	}
+	reverseProxy := newReverseProxy()
+	proxyFunc := http.HandlerFunc(sentryFunc(proxy.defaultProxyFunc(reverseProxy)))
 
 	proxy.proxyHandlerFunc = proxyFunc
+	proxy.vampire = vampire
 
-	if err := generateRooCA(proxy); err != nil {
+	if err := generateRooCA(proxy.pki); err != nil {
 		return nil, errors.Wrap(err, "error while generating root CA")
 	}
 
@@ -80,8 +84,8 @@ var commonSubject = pkix.Name{
 
 const caName = "VamproxyRootCA"
 
-func generateRooCA(proxy *Proxy) error {
-	if _, err := proxy.pki.GetCA(caName); err == nil {
+func generateRooCA(pki *easypki.EasyPKI) error {
+	if _, err := pki.GetCA(caName); err == nil {
 		return nil
 	} else {
 		// this warn ir ok during the first run
@@ -99,7 +103,7 @@ func generateRooCA(proxy *Proxy) error {
 	}
 	caRequest.Template.Subject.CommonName = caName
 
-	if err := proxy.pki.Sign(nil, caRequest); err != nil {
+	if err := pki.Sign(nil, caRequest); err != nil {
 		return errors.Wrapf(err, "Sign(nil, %v)", caRequest)
 	}
 
@@ -177,7 +181,7 @@ func sentryFunc(handler handlerFuncExt) http.HandlerFunc {
 	})
 }
 
-func defaultProxyFunc(proxy *Proxy, reverseProxy *ReverseProxy) handlerFuncExt {
+func (proxy *Proxy) defaultProxyFunc(reverseProxy *ReverseProxy) handlerFuncExt {
 	return handlerFuncExt(func(rw http.ResponseWriter, req *http.Request) error {
 		originalReqBytes, err := httputil.DumpRequest(req, true)
 
@@ -185,7 +189,7 @@ func defaultProxyFunc(proxy *Proxy, reverseProxy *ReverseProxy) handlerFuncExt {
 			return handleProxyError(req, rw, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "error while dumping incoming request"))
 		}
 
-		log.Printf("incoming request: \n%s\n", string(originalReqBytes))
+		proxy.vampire.OnIncomingRequest(originalReqBytes, req)
 
 		// it means we're receiving a HTTPS request
 		if req.Method == http.MethodConnect {
@@ -336,15 +340,14 @@ func (proxy *Proxy) handleHttpsProxy(req *http.Request, rw http.ResponseWriter) 
 		realReq.URL.Scheme = "https"
 		realReq.URL.Host = req.URL.Hostname()
 		realReq.RemoteAddr = req.RemoteAddr
+		removeProxyHeaders(realReq)
 
 		bytesReq, err := httputil.DumpRequest(realReq, true)
 		if err != nil {
 			log.Printf("could not dump the request: %+v", err)
-		} else {
-			log.Printf("outcoming request:\n%s\n", string(bytesReq))
 		}
 
-		removeProxyHeaders(realReq)
+		proxy.vampire.OnOutgoingRequest(bytesReq, realReq)
 
 		targetResponse, err := trans.RoundTrip(realReq)
 
@@ -352,12 +355,20 @@ func (proxy *Proxy) handleHttpsProxy(req *http.Request, rw http.ResponseWriter) 
 			return handleProxyError(realReq, tlsClientConnection, http.StatusBadGateway, RAW_HTTP_1_0_502, errors.Wrap(err, "error while executing round trip"))
 		}
 
+		targetResponse.Header.Set("Connection", "close")
+		targetResponse.Header.Set("Transfer-Encoding", "chunked")
+
+		resDump, err := httputil.DumpResponse(targetResponse, true)
+
+		if err != nil {
+			return handleProxyError(realReq, tlsClientConnection, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "error while dumping response"))
+		}
+
+		proxy.vampire.OnIncomingResponse(resDump, targetResponse)
+
 		if _, err := fmt.Fprintf(tlsClientConnection, "HTTP/%d.%d %s\r\n", 1, 1, targetResponse.Status); err != nil {
 			return handleProxyError(realReq, tlsClientConnection, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "error while writing http head"))
 		}
-
-		targetResponse.Header.Set("Connection", "close")
-		targetResponse.Header.Set("Transfer-Encoding", "chunked")
 
 		if err = targetResponse.Header.Write(tlsClientConnection); err != nil {
 			return handleProxyError(realReq, tlsClientConnection, http.StatusInternalServerError, RAW_HTTP_1_0_500, errors.Wrap(err, "error while writing headers to the client"))
@@ -422,48 +433,4 @@ func isEof(r *bufio.Reader) bool {
 		return true
 	}
 	return false
-}
-
-func newHttpsReverseProxy() *httputil.ReverseProxy {
-	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
-		Scheme: "https",
-		Host:   "golang.org",
-	})
-
-	transport := &http.Transport{}
-	// transport.Proxy = func(req *http.Request) (*url.URL, error) {
-
-	// }
-
-	proxy.Transport = transport
-
-	return proxy
-}
-
-func dialTLS(network, addr string) (net.Conn, error) {
-	conn, err := net.Dial(network, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
-	}
-	cfg := &tls.Config{ServerName: host}
-
-	tlsConn := tls.Client(conn, cfg)
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	cs := tlsConn.ConnectionState()
-	cert := cs.PeerCertificates[0]
-
-	// Verify here
-	cert.VerifyHostname(host)
-	log.Println(cert.Subject)
-
-	return tlsConn, nil
 }
