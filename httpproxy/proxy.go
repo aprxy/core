@@ -75,7 +75,7 @@ var commonSubject = pkix.Name{
 	OrganizationalUnit: []string{"IT"},
 	Locality:           []string{"Your Desk"},
 	Country:            []string{"ZU"},
-	Province:           []string{"Your Mom"},
+	Province:           []string{"Your House"},
 }
 
 const caName = "VamproxyRootCA"
